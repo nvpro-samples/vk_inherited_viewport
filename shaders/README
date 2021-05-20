@@ -1,0 +1,3 @@
+GLSL shaders, and header files that they depend on. ALL files that the
+shaders include MUST be in this directory (not sub-directory, etc.), including
+.h files, which are intended to be compile-able as both GLSL and C++

@@ -1,0 +1,10 @@
+// Copyright 2021 NVIDIA CORPORATION
+// SPDX-License-Identifier: Apache-2.0
+// C++/glsl polyglot for syncing descriptor binding numbers.
+#ifndef VK_NV_INHERITED_SCISSOR_VIEWPORT_BINDING_NUMBERS_H_
+#define VK_NV_INHERITED_SCISSOR_VIEWPORT_BINDING_NUMBERS_H_
+
+#define CAMERA_TRANSFORMS_BINDING 0
+#define INSTANCES_BINDING 1
+
+#endif /* !VK_NV_INHERITED_SCISSOR_VIEWPORT_BINDING_NUMBERS_H_ */
