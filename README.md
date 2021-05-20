@@ -15,24 +15,36 @@ re-recording the command buffer is likely negligible, but the
 techniques can be extended to more complicated renderers, where the
 savings can be substantial.
 
-[Tutorial Link](./docs/inherited.md.html)
+[TUTORIAL LINK](https://nvpro-samples.github.io/vk_inherited_viewport/docs/inherited.md.html)
+
+## Dependencies
+
+The optional `VK_NV_inherited_viewport_scissor` extension is currently
+only available in the [NVIDIA Beta
+Driver](https://developer.nvidia.com/vulkan-driver) for Windows 10 or
+Linux. The header file for the extension is included in this repository,
+you do not need to update your Vulkan SDK.
+
+Validation layer support for the extension is available in
+[v1.2.178](https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/tag/v1.2.178).
 
 ## Build and Run
 
 Clone https://github.com/nvpro-samples/nvpro_core.git
 next to this repository (or pull latest `master` if you already have it)
-TODO may become `main` branch.
-
-If needed, run `git submodule update --recursive` in `nvpro_core`.
 
 `mkdir build && cd build && cmake .. # Or use CMake GUI`
+
+If there are missing dependencies (e.g. glfw), run `git submodule
+update --init --recursive --checkout --force` in the `nvpro_core`
+repository.
 
 Then start the generated `.sln` in VS or run `make -j`.
 
 Run `vk_inherited_viewport` or `../../bin_x64/Release/vk_inherited_viewport.exe`
 
-I advise you to not run the Debug build unless you have my patched Vulkan
-validation layers TODO remove notice once patches are accepted & shipped.
+I advise you not to run the debug build unless you have the required
+validation layers.
 
 ## LICENSE
 
