@@ -1,0 +1,366 @@
+﻿<meta charset="utf-8" lang="en">
+
+**Inherited Viewport Scissor Sample**
+
+<small>by David Zhao Akeley</small>
+
+This sample provides an example of how indirect draw commands and the
+optional
+[`VK_NV_inherited_viewport_scissor`
+extension](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#VK_NV_inherited_viewport_scissor)
+can be used to maximize secondary command buffer re-use. The indirect draw
+commands allow a pre-recorded subpass secondary command buffer to deal with
+varying model counts and positions, while the extension helps deal with
+changing viewport sizes (due to the user resizing the window, etc.).
+The extension is not required to run the sample; the sample can still be
+used in this case as a simple example of secondary command buffer re-use.
+
+<script type="preformatted">
+
+
+# Introduction
+
+In core Vulkan (at time of writing), secondary command buffers do not inherit
+any state from the calling primary command buffer except for the active
+render pass and subpass. This means that secondary command buffers must
+set the dynamic viewport and scissor state themselves, and typically
+must be re-recorded with new state when the window is resized, even
+though all the other commands are unchanged. The extension provides
+a way to avoid this inefficiency.
+
+
+# Before
+
+!!! NOTE
+    This section very briefly describes secondary command buffer re-use;
+    if you prefer, you can skip the section entirely, or read a more
+    [in-depth overview](./secondary.md.html)
+    of this sample's secondary command buffer re-use strategy.
+
+The `App` class handles recording the drawing commands for the frame.
+It stores a few relevant variables; the secondary command buffer for the
+subpass and the viewport state it was recorded with,
+
+``` C
+  VkCommandBuffer m_secondaryCmdBuf = VK_NULL_HANDLE;
+  VkViewport      m_secondaryCmdBufViewport {};
+```
+
+as well as the size of the current frame's viewport, which is set
+each frame to match the swap chain image size.
+
+``` C
+  VkViewport         m_viewport{};
+```
+
+Typically you would use a function like this to detect when the
+secondary command buffer needs to be re-recorded due to stale
+viewport state.
+
+``` C
+  // Check if the secondary command buffer needs to be re-recorded.
+  bool needNewSecondaryCmdBuf()
+  {
+    // Missing?
+    if (m_secondaryCmdBuf == VK_NULL_HANDLE) return true;
+
+    // Depth bounds changed?
+    if (m_viewport.minDepth != m_secondaryCmdBufViewport.minDepth) return true;
+    if (m_viewport.maxDepth != m_secondaryCmdBufViewport.maxDepth) return true;
+
+    // Viewport 2D params changed?
+    if (m_viewport.x != m_secondaryCmdBufViewport.x) return true;
+    if (m_viewport.y != m_secondaryCmdBufViewport.y) return true;
+    if (m_viewport.width != m_secondaryCmdBufViewport.width) return true;
+    if (m_viewport.height != m_secondaryCmdBufViewport.height) return true;
+
+    // It's okay at this point.
+    return false;
+  }
+```
+
+and then re-record the secondary command buffer if needed, recording the
+viewport/scissor state commands with the new viewport size.
+
+``` C
+  // If the secondary command buffer isn't suitable for use anymore,
+  // schedule it for deletion at the end of this frame, and record
+  // a new one. Must be called within a beginFrame/endFrame pair.
+  void updateSecondaryCmdBuf()
+  {
+    if (!needNewSecondaryCmdBuf()) return;
+
+    // Get a new cmd buffer and throw away the old one.
+    m_frameManager.freeFrameCommandBuffer(m_secondaryCmdBuf);
+    m_secondaryCmdBuf = m_frameManager.allocateSecondaryCommandBuffer();
+
+    uint32_t subpass = 0;
+    VkCommandBufferInheritanceInfo inheritance {
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, nullptr,
+      m_renderPass, subpass };
+
+    // Begin subpass.
+    auto flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+               | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    VkCommandBufferBeginInfo beginInfo {
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      nullptr,
+      VkCommandBufferUsageFlags(flags),
+      &inheritance };
+    NVVK_CHECK(vkBeginCommandBuffer(m_secondaryCmdBuf, &beginInfo));
+
+    // Set viewport and scissors.
+    auto width  = uint32_t(m_viewport.width);
+    auto height = uint32_t(m_viewport.height);
+    vkCmdSetViewport(m_secondaryCmdBuf, 0, 1, &m_viewport);
+    VkRect2D scissor { { 0, 0 }, { width, height } };
+    vkCmdSetScissor(m_secondaryCmdBuf, 0, 1, &scissor);
+
+    // ...omitted drawing commands
+
+    // End command buffer and record parameters used.
+    NVVK_CHECK(vkEndCommandBuffer(m_secondaryCmdBuf));
+    m_secondaryCmdBufViewport = m_viewport;
+  }
+```
+
+(Note that the scissor is deduced from the viewport, so we don't have
+to track stale scissor state. Most applications also don't vary the
+depth bounds dynamically and can skip the "depth bounds changed"
+check.)
+
+
+# Extension
+
+The extension defines the following extension structure for
+`VkCommandBufferInheritanceInfo`:
+
+``` C
+// Provided by VK_NV_inherited_viewport_scissor
+typedef struct VkCommandBufferInheritanceViewportScissorInfoNV {
+    VkStructureType      sType;
+    const void*          pNext;
+    VkBool32             viewportScissor2D;
+    uint32_t             viewportDepthCount;
+    const VkViewport*    pViewportDepths;
+} VkCommandBufferInheritanceViewportScissorInfoNV;
+```
+
+If the extension structure is present with `viewportScissor2D` true,
+then the restriction on inheriting viewport and scissor state is
+relaxed. The
+[spec](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#VkCommandBufferInheritanceViewportScissorInfoNV)
+describes the requirements precisely, but basically, the viewport and
+scissor state is that set by the most-recently executed viewport/scissor
+setting command, subject to the restrictions:
+
+* The viewport and scissor state is always undefined at the start of
+  a primary command buffer, after a `vkCmdExecuteCommands`, and
+  after binding a pipeline that defines the state statically.
+  (This is all true in core Vulkan as well).
+
+* The $i^{th}$ inherited viewport must have the same `minDepth` and
+  `maxDepth` values as the $i^{th}$ entry of `pViewportDepths`, unless
+  this viewport is not consumed by any draw commands. Thus useful
+  inheritance is effectively limited to the 2D rectangle.
+
+Additionally, secondary command buffers that enable viewport/scissor
+inheritance are specifically forbidden from setting the inherited
+state themselves.
+
+!!! NOTE
+    To be clear, the viewports in `pViewportDepths` are used only for their
+    `minDepth` and `maxDepth` values; `x`, `y`, `width`, and `height`
+    are ignored. We decided to re-use the `VkViewport` struct (rather than
+    defining a new "depth only" viewport structure) as that allows more
+    code reuse between the `VK_NV_inherited_viewport_scissor` code path
+    and the fallback code path.
+
+
+# After
+
+Start by checking if the extension is supported by checking for the
+`VK_NV_INHERITED_VIEWPORT_SCISSOR_EXTENSION_NAME` string and placing a
+`VkPhysicalDeviceInheritedViewportScissorFeaturesNV` structure on the
+`pNext` chain of `VkPhysicalDeviceFeatures2`, as usual. Declare
+some variables to track this and set them if the needed support is found.
+
+``` C
+// Whether the device has the VK_NV_inherited_viewport_scissor
+// extension, and whether the user wants it in-use.
+static bool has_VK_NV_inherited_viewport_scissor = false;
+static bool use_VK_NV_inherited_viewport_scissor = false;
+
+// ...
+
+  // Enable VK_NV_inherited_viewport_scissor if supported.
+  VkPhysicalDeviceInheritedViewportScissorFeaturesNV
+    inheritedViewportScissorFeatures {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INHERITED_VIEWPORT_SCISSOR_FEATURES_NV,
+      nullptr };
+  // ...
+  // Check for VK_NV_inherited_viewport_scissor
+  if (ctx.hasDeviceExtension(VK_NV_INHERITED_VIEWPORT_SCISSOR_EXTENSION_NAME))
+  {
+    if (inheritedViewportScissorFeatures.inheritedViewportScissor2D)
+    {
+      has_VK_NV_inherited_viewport_scissor = true;
+      use_VK_NV_inherited_viewport_scissor = true;
+      // ...
+```
+
+Then declare a variable in `App` that tracks whether the secondary
+command buffer enabled viewport and scissor state inheritance.
+
+``` C
+  bool            m_secondaryCmdBufInheritViewport = false;
+```
+
+Modify the stale command buffer state check to skip checking for
+stale viewport x/y state if those values are being inherited; note
+that we still have to check for changes to the depth range state
+due to the `pViewportDepths` restriction.
+
+``` C
+  // Check if the secondary command buffer needs to be re-recorded.
+  bool needNewSecondaryCmdBuf()
+  {
+    // Missing?
+    if (m_secondaryCmdBuf == VK_NULL_HANDLE) return true;
+
+    // Depth bounds changed?
+    if (m_viewport.minDepth != m_secondaryCmdBufViewport.minDepth) return true;
+    if (m_viewport.maxDepth != m_secondaryCmdBufViewport.maxDepth) return true;
+
+    // Viewport 2D params changed, and not inheriting this state?
+    if (!m_secondaryCmdBufInheritViewport)
+    {
+      if (m_viewport.x != m_secondaryCmdBufViewport.x) return true;
+      if (m_viewport.y != m_secondaryCmdBufViewport.y) return true;
+      if (m_viewport.width != m_secondaryCmdBufViewport.width) return true;
+      if (m_viewport.height != m_secondaryCmdBufViewport.height) return true;
+    }
+
+    // It's okay at this point.
+    return false;
+  }
+```
+
+When recording the secondary command buffer, if the extension is
+supported, add the extension structure (which refereces `m_viewport`,
+to know the expected viewport depth), and skip recording the viewport
+and scissor state.
+
+``` C
+  // If the secondary command buffer isn't suitable for use anymore,
+  // schedule it for deletion at the end of this frame, and record
+  // a new one. Must be called within a beginFrame/endFrame pair.
+  void updateSecondaryCmdBuf()
+  {
+    if (!needNewSecondaryCmdBuf()) return;
+
+    // Get a new cmd buffer and throw away the old one.
+    m_frameManager.freeFrameCommandBuffer(m_secondaryCmdBuf);
+    m_secondaryCmdBuf = m_frameManager.allocateSecondaryCommandBuffer();
+
+    // Begin subpass.
+    // The extension struct needed to enable inheriting 2D viewport+scisors.
+    VkCommandBufferInheritanceViewportScissorInfoNV inheritViewportInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_VIEWPORT_SCISSOR_INFO_NV,
+        nullptr,
+        VK_TRUE,
+        1, &m_viewport };
+
+    // Typical inheritance info, add the extra extension if the user requests
+    // it.
+    uint32_t subpass = 0;
+    VkCommandBufferInheritanceInfo inheritance {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+        use_VK_NV_inherited_viewport_scissor ? &inheritViewportInfo : nullptr,
+        m_renderPass, subpass };
+
+    auto flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+               | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    VkCommandBufferBeginInfo beginInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        nullptr,
+        VkCommandBufferUsageFlags(flags),
+        &inheritance };
+    NVVK_CHECK(vkBeginCommandBuffer(m_secondaryCmdBuf, &beginInfo));
+
+    // Set viewport and scissors (if not inherited).
+    auto width  = uint32_t(m_viewport.width);
+    auto height = uint32_t(m_viewport.height);
+    if (!use_VK_NV_inherited_viewport_scissor)
+    {
+      vkCmdSetViewport(m_secondaryCmdBuf, 0, 1, &m_viewport);
+      VkRect2D scissor { { 0, 0 }, { width, height } };
+      vkCmdSetScissor(m_secondaryCmdBuf, 0, 1, &scissor);
+    }
+
+    // ...
+
+    // End command buffer and record parameters used.
+    NVVK_CHECK(vkEndCommandBuffer(m_secondaryCmdBuf));
+    m_secondaryCmdBufViewport = m_viewport;
+    m_secondaryCmdBufInheritViewport = use_VK_NV_inherited_viewport_scissor;
+  }
+```
+
+Finally, ensure that the viewport and scissor state is set somewhere
+for the secondary command buffer to inherit. I do this in the calling
+primary command buffer (re-recorded every frame), but, if you prefer,
+you can set the state in an earlier secondary command buffer in the
+same `vkCmdExecuteCommands` call.
+
+``` C
+  // Record commands to primary command buffer. Just starts render
+  // pass, set viewport/scissors, and call secondary command buffer.
+  void cmdDrawFrame(VkCommandBuffer cmdBuf, VkFramebuffer framebuffer)
+  {
+    std::array<VkClearValue, 2> clearValues{};
+    // ...
+
+    auto width  = uint32_t(m_viewport.width);
+    auto height = uint32_t(m_viewport.height);
+    VkRect2D scissor { {0, 0}, {width, height} };
+
+    VkRenderPassBeginInfo beginInfo {
+        // ...
+        };
+
+    // If the secondary command buffer doesn't inherit the viewport/scissor,
+    // then it sets it itself and the primary cmd buffer need not set that
+    // state.
+    if (m_secondaryCmdBufInheritViewport)
+    {
+      vkCmdSetViewport(cmdBuf, 0, 1, &m_viewport);
+      vkCmdSetScissor(cmdBuf, 0, 1, &scissor);
+    }
+    vkCmdBeginRenderPass(cmdBuf, &beginInfo,
+        VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+    vkCmdExecuteCommands(cmdBuf, 1, &m_secondaryCmdBuf);
+    vkCmdEndRenderPass(cmdBuf);
+  }
+```
+
+That's about it. When the extension is supported, you can tap the `i`
+key to toggle viewport/scissor inheritance. The sample logs when it
+recreates the framebuffer or re-records the secondary command
+buffer. You can see that when inheritance is disabled, both the
+secondary command buffer and framebuffer are recreated every time the
+window changes size, but when inheritance is enabled, only the
+framebuffer is recreated upon window resize:
+
+![](./console.png)
+
+</script>
+
+<!-- Markdeep: -->
+<link rel="stylesheet" href="vkrt_tutorial.css?">
+<script> window.markdeepOptions = { tocStyle: "medium" };</script>
+<script src="markdeep.min.js" charset="utf-8"></script>
+<script src="https://developer.nvidia.com/sites/default/files/akamai/gameworks/whitepapers/markdeep.min.js" charset="utf-8"></script>
+<script>
+    window.alreadyProcessedMarkdeep || (document.body.style.visibility = "visible")
+</script>

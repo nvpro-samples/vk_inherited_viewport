@@ -1,0 +1,609 @@
+<meta charset="utf-8" lang="en">
+
+**Inherited Viewport Scissor Sample**
+
+<small>by David Zhao Akeley</small>
+
+This article provides some info on how this sample is able to re-use its
+subpass secondary command buffer.
+
+<script type="preformatted">
+
+# Indirect Draw
+
+The fundamental feature that enables secondary command buffer re-use for
+graphics is indirect drawing: draw commands that source their parameters
+(`instanceCount`, ...) from a device buffer. This sample uses the command
+
+``` C
+void vkCmdDrawIndexedIndirect(
+    VkCommandBuffer                             commandBuffer,
+    VkBuffer                                    buffer,
+    VkDeviceSize                                offset,
+    uint32_t                                    drawCount,
+    uint32_t                                    stride);
+```
+
+The parameters of this command together define the locations (within a device
+buffer) of a sequence of `drawCount` `VkDrawIndexedIndirectCommand` structs:
+
+``` C
+typedef struct VkDrawIndexedIndirectCommand {
+    uint32_t    indexCount;
+    uint32_t    instanceCount;
+    uint32_t    firstIndex;
+    int32_t     vertexOffset;
+    uint32_t    firstInstance;
+} VkDrawIndexedIndirectCommand;
+```
+
+The behavior of the indirect drawing command will be as if the device
+executed `drawCount`-many `vkCmdDrawIndexed` commands, with the parameters
+for the $i^{th}$ draw coming from the identically-named members of the
+$i^{th}$ `VkDrawIndexedIndirectCommand`.
+
+For this sample, each `VkDrawIndexedIndirectCommand` corresponds to drawing
+all instances of a certain model. The `indexCount`, `firstIndex`, and
+`vertexOffset` defines the location within the bound vertex buffer for
+the model definition, and `instanceCount` and `firstInstance` defines
+the number and definitions of all instances of the model to draw.
+
+
+# Static / Dynamic Data
+
+Many graphics applications will sort data by their "hotness"; for this
+sample, it's sufficient to sort data into that is constant throughout
+the whole program (after its initial upload), and data that changes
+each frame.
+
+The unchanged data consists only of the models' definitions (vertices
+and indices), all stored together in one shared vertex buffer:
+
+``` C
+// Data that doesn't change after upload to device.
+struct StaticBufferData
+{
+  uint32_t   indices[MAX_INDICES];
+  VertexData vertices[MAX_VERTICES];
+
+  static constexpr VkIndexType indexType = VK_INDEX_TYPE_UINT32;
+};
+
+// In shaders/VertexData.h ...
+struct VertexData
+{
+  #ifdef __cplusplus
+    using vec4 = nvmath::vec4;
+  #endif
+
+  vec4 position;
+  vec4 normal;   // w ignored.
+  vec4 color;    // a is specular reflection brightness.
+
+#ifdef __cplusplus
+  static constexpr auto vec4format = VK_FORMAT_R32G32B32A32_SFLOAT;
+  static std::array<VkVertexInputAttributeDescription, 3> getAttributes();
+#endif
+};
+```
+
+The per-frame data consists of the indirect commands from before
+(which must change due to the changing `instanceCount` for each model),
+the array of instances (model transformation matrices), and the UBO for
+camera transformations (not really relevant to this discussion):
+
+``` C
+// Data that can change per-frame, stored in one buffer.
+struct DynamicBufferData
+{
+  int unused;  // guard for offsetof mistakes
+
+  // indirectCmds[i] holds info for drawing all instances of model i. Fill
+  // unused entries with 0s. vertexOffset defines the location in
+  // StaticBufferData::vertices that the model's verts are stored, and
+  // firstIndex and indexCount defines the section in
+  // StaticBufferData::indices.
+  alignas(1024) VkDrawIndexedIndirectCommand indirectCmds[MAX_MODELS];
+
+  // Array for storing instance data (model matrix, etc.)
+  // Subsections are used for different models, defined by
+  // indirectCmds[i].firstInstance and instanceCount.
+  alignas(1024) InstanceData instances[MAX_INSTANCES];
+
+  // Camera transformation matrices, bound as UBO.
+  alignas(1024) CameraTransforms cameraTransforms;
+};
+
+// In shaders/InstanceData.h ...
+struct InstanceData
+{
+  #ifdef __cplusplus
+    using mat4 = nvmath::mat4;
+  #endif
+
+  mat4 modelMatrix;
+};
+```
+
+The dynamic data will need to be re-uploaded from a staging buffer each frame.
+This command can be put in a primary command buffer that is recorded once and
+re-used.
+
+``` C
+class App
+{
+// ...
+
+  // Command buffer and submit info for uploading DynamicBufferData
+  // from the staging buffer to the device.
+  VkCommandBuffer m_dynamicBufferUploadCmdBuffer{};
+  VkSubmitInfo    m_dynamicBufferUploadSubmitInfo{};
+
+    // ...
+
+    // Record the DynamicBufferData staging->device copy command.
+    m_dynamicBufferUploadCmdBuffer = m_frameManager.recordPrimaryCommandBuffer();
+    m_buffers.cmdTransferDynamicStaging(
+        m_dynamicBufferUploadCmdBuffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_INDIRECT_COMMAND_READ_BIT
+        | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+        | VK_ACCESS_UNIFORM_READ_BIT
+        | VK_ACCESS_SHADER_READ_BIT);
+    NVVK_CHECK(vkEndCommandBuffer(m_dynamicBufferUploadCmdBuffer));
+    m_dynamicBufferUploadSubmitInfo = {
+        VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr,
+        1, &m_dynamicBufferUploadCmdBuffer, 0, nullptr };
+```
+
+where `cmdTransferDynamicStaging` is defined by
+
+``` C
+class ScopedBuffers
+{
+// ...
+  nvvk::BufferDedicated    m_dynamicBuffer;
+  nvvk::BufferDedicated    m_dynamicStaging;
+  DynamicBufferData*       m_dynamicStagingPtr;
+
+  // ...
+
+  // Record a command for transferring dynamic buffer data from
+  // staging to device. Includes barriers before and
+  // after for the given stage and access flags.
+  void cmdTransferDynamicStaging(VkCommandBuffer      cmdBuf,
+                                 VkPipelineStageFlags stageFlags,
+                                 VkAccessFlags        accessFlags) const
+  {
+    VkBufferMemoryBarrier beforeBarrier {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        nullptr,
+        accessFlags,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        0, 0,
+        m_dynamicBuffer.buffer,
+        0, VK_WHOLE_SIZE };
+    vkCmdPipelineBarrier(
+        cmdBuf,
+        stageFlags,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 1, &beforeBarrier, 0, nullptr);
+
+    VkBufferCopy bufferCopy { 0, 0, sizeof(DynamicBufferData) };
+    vkCmdCopyBuffer(cmdBuf, m_dynamicStaging.buffer, m_dynamicBuffer.buffer,
+                    1, &bufferCopy);
+
+    VkBufferMemoryBarrier afterBarrier {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        accessFlags,
+        0, 0,
+        m_dynamicBuffer.buffer,
+        0, VK_WHOLE_SIZE };
+    vkCmdPipelineBarrier(
+        cmdBuf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        stageFlags,
+        0, 0, nullptr, 1, &afterBarrier, 0, nullptr);
+  }
+};
+```
+
+Note the necessity of `VK_ACCESS_INDIRECT_COMMAND_READ_BIT`.
+
+The host program fills the dynamic staging buffer evey frame with the
+latest instance and camera data; to avoid a data race, the application
+must use a fence to ensure the previous frame's staging-to-device copy
+finishes before overwriting the staging buffer with the current frame's
+information.
+
+``` C
+  void doFrame()
+  {
+  // ...
+
+    // Write new camera and instance data to staging buffer, then
+    // copy to device. Note that a VkFence is used to synchronize host
+    // and device access to staging buffer (see ScopedBuffers).
+    VkFence dynamicStagingFence = m_buffers.getFence();
+    vkWaitForFences(m_context, 1, &dynamicStagingFence, VK_TRUE, UINT64_MAX);
+    DynamicBufferData* mapped = m_buffers.getDynamicStagingPtr();
+    uncheckedUpdateDynamicStaging(mapped);
+
+    // Start the upload of the data from the DynamicBufferData staging buffer.
+    // Need the fence to ensure the transfer finishes before updating the
+    // staging buffer in the next frame.
+    vkResetFences(m_context, 1, &dynamicStagingFence);
+    vkQueueSubmit(m_frameManager.getQueue(),
+                  1, &m_dynamicBufferUploadSubmitInfo, m_buffers.getFence());
+```
+
+Most of details of `uncheckedUpdateDynamicStaging` and the example
+animation that produces the instance data is out of the scope of this
+article; however, be aware that a limitation of this strategy is the
+fixed limit on the total number of models and instances that can be
+supported.  There is a check in `tickAnimation` that prevents adding
+additional instances if the `MAX_INSTANCES` limit is reached:
+
+``` C
+      if (modelData.instances.size() >= modelData.maxInstances)
+      {
+        if (!m_warnedTooManyInstances)
+        {
+          fprintf(stderr, "tickAnimation: reached maxInstances limit\n");
+          m_warnedTooManyInstances = true;
+        }
+      }
+      else
+      {
+        modelData.instances.push_back(instance);
+      }
+```
+
+The static data also has to be initialized and copied to the device;
+this is fairly straightforward so I'll omit the code for this (it's in
+`App::fillStaticStagingInitDraws` and
+`ScopedBuffers::cmdTransferStaticStaging`). Basically, we just have
+to concatenate the vertex and index data for all models together
+into `StaticBufferData`, and remember in `m_modelDraws` the subsections
+in which each model was stored:
+
+``` C
+// Information needed to locate the vertices etc. of a model, plus its list of
+// instances.
+struct ModelDrawInfo
+{
+  // Model indices stored in this section of StaticBufferData::indices
+  uint32_t firstIndex;
+  uint32_t indexCount;
+
+  // Vertex indices stored starting at this index in StaticBufferData::vertices
+  int32_t vertexOffset;
+
+  // Section of DynamicBufferData::instances reserved for this model's instances
+  uint32_t firstInstance;
+  uint32_t maxInstances;
+
+  // List of instances. size() must be no more than maxInstances.
+  std::vector<AnimatedInstanceData> instances; // NOTE: This is what tickAnimation modifies every frame.
+};
+
+// ...
+
+class App
+{
+  // ...
+
+  // Buffers and info on subsections allocated for each model.
+  ScopedBuffers              m_buffers;
+  std::vector<ModelDrawInfo> m_modelDraws;
+```
+
+!!! TIP Fast Object Deletion
+    Another tip to take away from `tickAnimation` is fast removal from
+    the middle of an `std::vector`. When the animation has to remove
+    an instance from the middle of the instances array, instead of
+    "filling the gap" by shifting over all subsequent instances
+    ($O(n)$), it instead overwrites the gap with last instance in the array
+    and then deletes the last instance from its original location.
+    This only has $O(1)$ cost, and since depth testing is enabled,
+    modifying the order that instances are drawn only causes an observable
+    change in the very rare case when the depth test is tied for a fragment.
+
+
+# Drawing
+
+We now have to fill in the `VkDrawIndexedIndirectCommand` array and
+record the indirect drawing command to the re-used secondary command
+buffer:
+
+``` C
+class App
+{
+// ...
+
+  VkCommandBuffer m_secondaryCmdBuf = VK_NULL_HANDLE;
+```
+
+## Primary Command Buffer
+
+The sample defines a simple one-subpass render pass. The per-frame
+`doFrame` function delegates recording render pass commands to
+`cmdDrawFrame`; this starts mostly the same as what you'd expect, with
+the notable change of using
+`VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS` because the actual
+drawing commands will not be in the primary command buffer.
+
+``` C
+  // Record commands to primary command buffer. Just starts render
+  // pass, set viewport/scissors, and call secondary command buffer.
+  void cmdDrawFrame(VkCommandBuffer cmdBuf, VkFramebuffer framebuffer)
+  {
+    std::array<VkClearValue, 2> clearValues{};
+    // ...
+
+    VkRenderPassBeginInfo beginInfo {
+        VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        nullptr,
+        m_renderPass,
+        framebuffer,
+        { { 0, 0 }, { width, height } }, // omitted width/height initialization
+        uint32_t(clearValues.size()),
+        clearValues.data() };
+
+    // ... omitted viewport/scissor code (topic of main article).
+
+    vkCmdBeginRenderPass(cmdBuf, &beginInfo,
+                         VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+```
+
+We then execute the actual secondary command buffer (to be looked at shortly).
+
+``` C
+    vkCmdExecuteCommands(cmdBuf, 1, &m_secondaryCmdBuf);
+```
+
+I'd like to end the render pass now, but there's a slight complication
+from the Dear ImGui interface, which also needs to record some drawing
+commands.  Dear ImGui is a black box to me, so I don't try to reuse
+its recorded commands; nevertheless, these commands have to be
+recorded to a (temporary) secondary command buffer anyway, to match
+`VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS`.
+
+``` C
+    VkCommandBufferInheritanceInfo inheritance {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, nullptr,
+        m_renderPass, 0 };
+    VkCommandBuffer guiCmdBuf = m_frameManager.recordSecondaryCommandBuffer(
+        VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &inheritance);
+    m_frameManager.freeFrameCommandBuffer(guiCmdBuf);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), guiCmdBuf);
+    vkEndCommandBuffer(guiCmdBuf);
+    vkCmdExecuteCommands(cmdBuf, 1, &guiCmdBuf);
+```
+
+Finally, the render pass can end.
+
+``` C
+    vkCmdEndRenderPass(cmdBuf);
+```
+
+!!! NOTE
+    It would have been somewhat more efficient to execute both
+    `m_secondaryCmdBuf` and `guiCmdBuf` in the same
+    `vkCmdExecuteCommands`; however, I decided not to do this to avoid
+    making the GUI code too distracting for an educational sample.
+
+
+## Secondary Command Buffer
+
+The `updateSecondaryCmdBuf` function fills `m_secondaryCmdBuf` with
+the actual drawing commands. This is also fairly similar to what we'd
+see if the drawing commands were in the primary command buffer, except
+that there's (almost) no trace of the render pass instance.
+
+We call this function in `doFrame`, just before recording the render
+pass instance for the primary command buffer.
+
+``` C
+  // Body of main loop.
+  void doFrame()
+  {
+  // ...
+
+    // Select framebuffer for this frame.
+    m_framebuffers.recreateNowIfNeeded(m_frameManager.getSwapChain());
+    VkFramebuffer framebuffer = m_framebuffers[acquired.index];
+
+    // Replace the secondary command buffer if it is no longer
+    // suitable for use.
+    updateSecondaryCmdBuf();
+
+    // Record and submit primary command buffer, and present frame.
+    // The primary command buffer is magically cleaned up.
+    cmdDrawFrame(primaryCmdBuf, framebuffer);
+  }
+```
+
+The function starts by checking if the secondary command buffer needs
+to be re-recorded (topic of the main article); if so, allocate
+a new secondary command buffer and schedule the old one for destruction.
+
+``` C
+  void updateSecondaryCmdBuf()
+  {
+    if (!needNewSecondaryCmdBuf()) return;
+
+    // Get a new cmd buffer and throw away the old one.
+    m_frameManager.freeFrameCommandBuffer(m_secondaryCmdBuf);
+    m_secondaryCmdBuf = m_frameManager.allocateSecondaryCommandBuffer();
+```
+
+!!! NOTE
+    The old secondary command buffer cannot just be re-recorded in-place
+    as it may still be executing for the previous frame.
+
+When recording a secondary command buffer for use in a subpass, the
+`VkCommandBeginInfo` used to start recording must include a
+`VkCommandBufferInheritanceInfo` that specifies the render pass and
+subpass it will be used in, along with the
+`VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT` flag. The
+inheritance struct is also where the extension struct explained in the
+main article is added.
+
+``` C
+    // Begin subpass.
+    // The extension struct needed to enable inheriting 2D viewport+scisors.
+    VkCommandBufferInheritanceViewportScissorInfoNV inheritViewportInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_VIEWPORT_SCISSOR_INFO_NV,
+        nullptr,
+        VK_TRUE,
+        1, &m_viewport };
+
+    // Typical inheritance info, add the extra extension if the user requests
+    // it.
+    uint32_t subpass = 0;
+    VkCommandBufferInheritanceInfo inheritance {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+        use_VK_NV_inherited_viewport_scissor ? &inheritViewportInfo : nullptr,
+        m_renderPass, subpass };
+
+    auto flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+               | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    VkCommandBufferBeginInfo beginInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        nullptr,
+        VkCommandBufferUsageFlags(flags),
+        &inheritance };
+    NVVK_CHECK(vkBeginCommandBuffer(m_secondaryCmdBuf, &beginInfo));
+
+```
+
+We then have to set the dynamic viewport and scissor state; using the
+extension to skip these commands is explained in the main article.
+
+``` C
+    // Set viewport and scissors (if not inherited).
+    auto width  = uint32_t(m_viewport.width);
+    auto height = uint32_t(m_viewport.height);
+    // ...
+    vkCmdSetViewport(m_secondaryCmdBuf, 0, 1, &m_viewport);
+    VkRect2D scissor { { 0, 0 }, { width, height } };
+    vkCmdSetScissor(m_secondaryCmdBuf, 0, 1, &scissor);
+```
+
+Except for the `vkCmdDrawIndexedIndirect`, the rest of the secondary
+command buffer just consists of typical code for binding pipelines,
+vertex buffers, and descriptor sets, and issuing draw calls.
+
+``` C
+    VkDescriptorSet descriptorSet = m_bufferDescriptors.getSet();
+
+    // Draw background as full-screen triangle.
+    vkCmdBindPipeline(m_secondaryCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      m_backgroundPipeline);
+    vkCmdBindDescriptorSets(
+        m_secondaryCmdBuf,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_backgroundPipeline.getLayout(),
+        0, 1, &descriptorSet, 0, nullptr);
+    vkCmdDraw(m_secondaryCmdBuf, 3, 1, 0, 0);
+
+    // Draw objects. Bind vertex and index buffer.  Draw indirect
+    // allows us to vary the number of drawn objects without
+    // re-recording this secondary command buffer.
+    VkBuffer     vertexBuffer       = m_buffers.getStaticBuffer();
+    VkDeviceSize vertexBufferOffset = offsetof(StaticBufferData, vertices);
+    vkCmdBindVertexBuffers(
+        m_secondaryCmdBuf,
+        0, 1,
+        &vertexBuffer, &vertexBufferOffset);
+    vkCmdBindIndexBuffer(
+        m_secondaryCmdBuf,
+        m_buffers.getStaticBuffer(),
+        offsetof(StaticBufferData, indices),
+        StaticBufferData::indexType);
+    vkCmdBindPipeline(
+        m_secondaryCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_objectPipeline);
+    vkCmdBindDescriptorSets(
+        m_secondaryCmdBuf,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_objectPipeline.getLayout(),
+        0, 1, &descriptorSet, 0, nullptr);
+    vkCmdDrawIndexedIndirect(
+        m_secondaryCmdBuf,
+        m_buffers.getDynamicBuffer(),
+        offsetof(DynamicBufferData, indirectCmds),
+        MAX_MODELS,                            // NOTE: Length of array, see DynamicBufferData definition.
+        sizeof(VkDrawIndexedIndirectCommand)); // NOTE: Tightly-packed VkDrawIndexedIndirectCommand array.
+```
+
+This concludes the secondary command buffer.
+
+``` C
+    NVVK_CHECK(vkEndCommandBuffer(m_secondaryCmdBuf));
+```
+
+
+## Indirect Draw Commands
+
+The last piece of the puzzle is to make sure that the indirect draw
+commands are correct when the secondary command buffer executes. The details
+of the animation are again out-of-scope, but the gist is that
+`m_modelDraws[i]` contains info for drawing the $i^{th}$ model, with
+`m_modelDraws[i].instances` being the list of instances to draw.
+So `uncheckedUpdateDynamicStaging` just has to translate this info
+to a native Vulkan indirect draw command.
+
+``` C
+  // Write new values to dynamic staging buffer. No synchronization done.
+  void uncheckedUpdateDynamicStaging(DynamicBufferData* mapped)
+  {
+    // Convert models into draw indexed indirect commands.
+    for (size_t i = 0; i < m_modelDraws.size(); ++i)
+    {
+      mapped->indirectCmds[i].indexCount    = m_modelDraws[i].indexCount;
+      mapped->indirectCmds[i].instanceCount =
+          uint32_t(m_modelDraws[i].instances.size());
+      mapped->indirectCmds[i].firstIndex    = m_modelDraws[i].firstIndex;
+      mapped->indirectCmds[i].vertexOffset  = m_modelDraws[i].vertexOffset;
+      mapped->indirectCmds[i].firstInstance = m_modelDraws[i].firstInstance;
+    }
+```
+
+Recall that the staging buffer gets uploaded to the actual dynamic
+data device buffer every frame, and that the memory barrier ensures
+the later drawing command reads the up-to-date values.
+
+Excess drawing commands get zero-initialized; this effectively turns
+them into no-ops (note that unlike many "array size" parameters, there is
+no requirement in Vulkan that any indexed draw parameters are non-zero).
+
+``` C
+    // Fill excess commands with 0s to avoid trouble.
+    for (size_t i = m_modelDraws.size(); i < MAX_MODELS; ++i)
+    {
+      mapped->indirectCmds[i].indexCount    = 0;
+      mapped->indirectCmds[i].instanceCount = 0;
+      mapped->indirectCmds[i].firstIndex    = 0;
+      mapped->indirectCmds[i].vertexOffset  = 0;
+      mapped->indirectCmds[i].firstInstance = 0;
+    }
+
+    // ... omitted code for updating camera UBO and instances array.
+```
+
+<big>[Back to the main article](./inherited.md.html#before)</big>
+
+
+</script>
+
+<!-- Markdeep: -->
+<link rel="stylesheet" href="vkrt_tutorial.css?">
+<script> window.markdeepOptions = { tocStyle: "medium" };</script>
+<script src="markdeep.min.js" charset="utf-8"></script>
+<script src="https://developer.nvidia.com/sites/default/files/akamai/gameworks/whitepapers/markdeep.min.js" charset="utf-8"></script>
+<script>
+    window.alreadyProcessedMarkdeep || (document.body.style.visibility = "visible")
+</script>
