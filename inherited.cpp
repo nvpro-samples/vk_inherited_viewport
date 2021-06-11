@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Host code for vk_inherited_viewport sample.
+// Draws the same scene to 4 viewports on the screen.
 // See README.md or docs/inherited.md.html for commentary.
 #include <algorithm>
 #include <array>
@@ -24,6 +25,7 @@
 #include "nvvk/pipeline_vk.hpp"
 #include "nvvk/renderpasses_vk.hpp"
 #include "nvvk/shaders_vk.hpp"
+#include "nvvk/images_vk.hpp"
 #include "nvpsystem.hpp"
 
 #include "imgui.h"
@@ -44,8 +46,6 @@
 static bool has_VK_NV_inherited_viewport_scissor = false;
 static bool use_VK_NV_inherited_viewport_scissor = false;
 
-static bool forceRerecordSecondaryCmdBuf = false;
-
 static bool vsync = true;
 
 // Camera parameters (global)
@@ -64,7 +64,7 @@ static bool guiVisible = true;
 
 // Whether we should continuously vary the viewport size to test
 // viewport resize handling.
-static bool wobbleViewport = false;
+static bool wobbleViewport = true;
 
 // Wether we should be printing framebuffer / secondary command buffer
 // recreations to stdout.
@@ -128,7 +128,7 @@ struct StaticBufferData
   static constexpr VkIndexType indexType = VK_INDEX_TYPE_UINT32;
 };
 
-// Data that can change per-frame, stored in one buffer.
+// Scene data that can change per-frame, stored in one buffer.
 struct DynamicBufferData
 {
   int unused;  // guard for offsetof mistakes
@@ -144,9 +144,6 @@ struct DynamicBufferData
   // Subsections are used for different models, defined by
   // indirectCmds[i].firstInstance and instanceCount.
   alignas(1024) InstanceData instances[MAX_INSTANCES];
-
-  // Camera transformation matrices, bound as UBO.
-  alignas(1024) CameraTransforms cameraTransforms;
 };
 
 // Instance data, plus extra data needed for animation.
@@ -211,16 +208,21 @@ class ScopedBuffers
     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
   // Same, but for DynamicBufferData.
-  nvvk::Buffer    m_dynamicBuffer;
-  nvvk::Buffer    m_dynamicStaging;
-  DynamicBufferData*       m_dynamicStagingPtr;
+  nvvk::Buffer       m_dynamicBuffer;
+  nvvk::Buffer       m_dynamicStaging;
+  DynamicBufferData* m_dynamicStagingPtr;
 
   static constexpr VkBufferUsageFlags dynamicUsage =
     VK_BUFFER_USAGE_TRANSFER_DST_BIT
     | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
-    | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
     | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
+  // Device UBO for passing camera transformations.
+  // Holds type CameraTransforms.
+  nvvk::Buffer m_cameraBuffer;
+  static constexpr VkBufferUsageFlags cameraUsage =
+    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
 
   // Fence for synchronizing access to dynamic staging buffer.
   // Signalled when the staging->device transfer done, wait for
@@ -257,6 +259,8 @@ public:
     m_dynamicStagingPtr = static_cast<DynamicBufferData*>(
       m_allocator.map(m_dynamicStaging));
 
+    m_cameraBuffer = m_allocator.createBuffer(sizeof(CameraTransforms), cameraUsage);
+
     VkFenceCreateInfo fenceInfo = {
         VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr,
         VK_FENCE_CREATE_SIGNALED_BIT };
@@ -271,6 +275,7 @@ public:
     m_allocator.destroy(m_staticStaging);
     m_allocator.destroy(m_dynamicBuffer);
     m_allocator.destroy(m_dynamicStaging);
+    m_allocator.destroy(m_cameraBuffer);
     m_allocator.deinit();
   }
 
@@ -296,6 +301,11 @@ public:
   VkBuffer getDynamicBuffer() const
   {
     return m_dynamicBuffer.buffer;
+  }
+
+  VkBuffer getCameraBuffer() const
+  {
+    return m_cameraBuffer.buffer;
   }
 
   // Return the staging buffer pointer. Use the fence below to
@@ -523,11 +533,11 @@ public:
     VkAttachmentDescription colorAttachment{};
     colorAttachment.format         = colorFormat;
     colorAttachment.samples        = VK_SAMPLE_COUNT_1_BIT;
-    colorAttachment.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorAttachment.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachment.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttachment.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.initialLayout  = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     colorAttachment.finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
     VkAttachmentDescription depthAttachment{};
@@ -608,7 +618,8 @@ class BufferDescriptors
 public:
   BufferDescriptors(VkDevice device,
                     VkBuffer staticBuffer,
-                    VkBuffer dynamicBuffer)
+                    VkBuffer dynamicBuffer,
+                    VkBuffer cameraBuffer)
       : m_descriptors(device)
   {
     // Set up descriptor set layout, one descriptor each for camera transforms
@@ -625,17 +636,13 @@ public:
     // Only need 1 descriptor set (never changes). Initialize it.
     m_descriptors.initPool(1);
     VkDescriptorBufferInfo uboInfo{
-        dynamicBuffer,
-        offsetof(DynamicBufferData, cameraTransforms),
-        sizeof(DynamicBufferData::cameraTransforms)};
+        cameraBuffer,
+        0,
+        sizeof(CameraTransforms)};
     VkDescriptorBufferInfo instanceBufferInfo{
         dynamicBuffer,
         offsetof(DynamicBufferData, instances),
         sizeof(DynamicBufferData::instances)};
-    VkDescriptorBufferInfo vertexBufferInfo{
-        staticBuffer,
-        offsetof(StaticBufferData, vertices),
-        sizeof(StaticBufferData::vertices)};
     std::array<VkWriteDescriptorSet, 2> writes = {
         m_descriptors.makeWrite(0, CAMERA_TRANSFORMS_BINDING, &uboInfo),
         m_descriptors.makeWrite(0, INSTANCES_BINDING, &instanceBufferInfo)};
@@ -807,10 +814,9 @@ void cameraTransformsFromGlobalCamera(CameraTransforms* out,
 
   cameraForward = nvmath::vec3f(sinPhi * cosTheta, cosPhi, sinPhi * sinTheta);
   nvmath::vec3f up(0, 1, 0);
-  nvmath::vec3f cameraCenter = cameraPosition + cameraForward;
-  nvmath::mat4  view = nvmath::look_at(cameraPosition, cameraCenter, up);
-  nvmath::mat4  proj =
-      nvmath::perspectiveVK(cameraFOV, aspectRatio, cameraNear, cameraFar);
+  nvmath::vec3f center = cameraPosition + cameraForward;
+  nvmath::mat4  view   = nvmath::look_at(cameraPosition, center, up);
+  nvmath::mat4  proj   = nvmath::perspectiveVK(cameraFOV, aspectRatio, cameraNear, cameraFar);
 
   out->view         = view;
   out->proj         = proj;
@@ -892,7 +898,6 @@ void addCallbacks(GLFWwindow* pWindow)
   // 'r' resets depth bounds to default.
   // 'd' toggles depth debug coloring.
   // 'i' toggles inheriting viewport/scissors.
-  // 'f' force re-record secondary command buffer.
   // 'u' toggles UI visibility.
   // 'v' toggles vsync.
   glfwSetCharCallback(
@@ -903,9 +908,6 @@ void addCallbacks(GLFWwindow* pWindow)
       {
         case 'd':
           colorByDepth = !colorByDepth;
-          break;
-        case 'f':
-          forceRerecordSecondaryCmdBuf = true;
           break;
         case 'i':
           if (has_VK_NV_inherited_viewport_scissor)
@@ -1105,6 +1107,17 @@ private:
 
 
 
+// Command buffer used for holding drawing commands for the subpass,
+// plus viewport/scissor parameters used for its recording.
+struct SubpassSecondary
+{
+  VkCommandBuffer cmdBuf{};
+  bool            inheritViewportScissor{};
+  VkViewport      viewport{};
+};
+
+
+
 // Class defining main loop of the sample.
 class App
 {
@@ -1126,13 +1139,10 @@ private:
   GLFWwindow*    m_window;
   VkSurfaceKHR   m_surface;
 
-  // Secondary command buffer (contains actual draw commands), the
-  // viewport used when it was recorded, and whether the secondary
-  // command buffer enabled inheriting 2D viewport and scissors from
-  // the primary command buffer.
-  VkCommandBuffer m_secondaryCmdBuf = VK_NULL_HANDLE;
-  VkViewport      m_secondaryCmdBufViewport{};
-  bool            m_secondaryCmdBufInheritViewport = false;
+  // Secondary command buffers (contains actual draw commands).
+  // One used per viewport when viewport/scissor inheritance disabled;
+  // just the 0th one used when enabled.
+  SubpassSecondary m_subpassSecondaryArray[2][2];
 
   // Buffers and info on subsections allocated for each model.
   ScopedBuffers              m_buffers;
@@ -1151,10 +1161,9 @@ private:
   Framebuffers      m_framebuffers;
   BufferDescriptors m_bufferDescriptors;
 
-  // Graphics pipelines, and current viewport to use.
+  // Graphics pipelines.
   BackgroundPipeline m_backgroundPipeline;
   ObjectPipeline     m_objectPipeline;
-  VkViewport         m_viewport{};
 
   // GUI stuff.
   Gui m_gui;
@@ -1183,12 +1192,13 @@ private:
       , m_framebuffers(ctx.m_physicalDevice, ctx, m_renderPass, m_depthFormat)
       , m_bufferDescriptors(ctx,
                             m_buffers.getStaticBuffer(),
-                            m_buffers.getDynamicBuffer())
+                            m_buffers.getDynamicBuffer(),
+                            m_buffers.getCameraBuffer())
       , m_backgroundPipeline(ctx, m_renderPass, m_bufferDescriptors)
       , m_objectPipeline(ctx, m_renderPass, m_bufferDescriptors)
       , m_prevFrameTime(glfwGetTime())
       , m_frameManager(ctx, surface, 1, 1, true, m_colorFormat,
-                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
   {
     VkCommandBuffer cmdBuf = m_frameManager.recordOneTimeCommandBuffer();
 
@@ -1254,203 +1264,25 @@ private:
     glfwPollEvents();
     waitNonzeroFramebufferSize(m_window, &width, &height);
 
-    // Write new camera and instance data to staging buffer, then
+    float wobblex = float(width) * 0.5f;
+    float wobbley = float(height) * 0.5f;
+    if (wobbleViewport)
+    {
+      wobblex = float(width) * (0.5f + float(sin(glfwGetTime()) * 0.2f));
+      wobbley = float(height) * (0.5f + float(cos(glfwGetTime()) * 0.2f));
+    }
+
+    // Write new instance data to staging buffer, then
     // copy to device. Note that a VkFence is used to synchronize host
     // and device access to staging buffer (see ScopedBuffers).
     VkFence dynamicStagingFence = m_buffers.getFence();
     vkWaitForFences(m_context, 1, &dynamicStagingFence, VK_TRUE, UINT64_MAX);
     DynamicBufferData* mapped = m_buffers.getDynamicStagingPtr();
-    uncheckedUpdateDynamicStaging(mapped);
 
-    // Start the upload of the data from the DynamicBufferData staging buffer.
-    // Need the fence to ensure the transfer finishes before updating the
-    // staging buffer in the next frame.
-    vkResetFences(m_context, 1, &dynamicStagingFence);
-    vkQueueSubmit(m_frameManager.getQueue(),
-                  1, &m_dynamicBufferUploadSubmitInfo, m_buffers.getFence());
-
-    // Begin the frame, starting primary command buffer recording.
-    // beginFrame converts the intended width/height to actual
-    // swap chain width/height, which could differ from requested.
-    // Update (local copy of) viewport with this width/height.
-    VkCommandBuffer primaryCmdBuf;
-    nvvk::SwapChainAcquireState acquired;
-    m_frameManager.wantVsync(vsync);
-    m_frameManager.beginFrame(&primaryCmdBuf, &acquired, &width, &height);
-    m_viewport.width  = float(width) * getViewportHorizontalScale();
-    m_viewport.height = float(height);
-
-    // Do ImGui stuff.
-    m_gui.doFrame();
-
-    // Udate viewport depth bounds from global variables (ImGui and
-    // glfw key callbacks modifiy them).
-    m_viewport.minDepth = minDepth;
-    m_viewport.maxDepth = maxDepth;
-
-    // Select framebuffer for this frame.
-    m_framebuffers.recreateNowIfNeeded(m_frameManager.getSwapChain());
-    VkFramebuffer framebuffer = m_framebuffers[acquired.index];
-
-    // Replace the secondary command buffer if it is no longer
-    // suitable for use.
-    updateSecondaryCmdBuf();
-
-    // Record and submit primary command buffer, and present frame.
-    // The primary command buffer is magically cleaned up.
-    cmdDrawFrame(primaryCmdBuf, framebuffer);
-    m_frameManager.endFrame(primaryCmdBuf);
-  }
-
-  float getViewportHorizontalScale()
-  {
-    return !wobbleViewport ? 1.0f :
-                             0.875f + 0.125f * float(sin(glfwGetTime() * 4.0));
-  }
-
-  // Check if the secondary command buffer needs to be re-recorded.
-  bool needNewSecondaryCmdBuf()
-  {
-    // Debug backdoor.
-    if (forceRerecordSecondaryCmdBuf)
-    {
-      forceRerecordSecondaryCmdBuf = false;
-      return true;
-    }
-    // Changed inheritance setting.
-    if (use_VK_NV_inherited_viewport_scissor != m_secondaryCmdBufInheritViewport)
-    {
-      return true;
-    }
-
-    // Missing?
-    if (m_secondaryCmdBuf == VK_NULL_HANDLE) return true;
-
-    // Depth bounds changed?
-    if (m_viewport.minDepth != m_secondaryCmdBufViewport.minDepth) return true;
-    if (m_viewport.maxDepth != m_secondaryCmdBufViewport.maxDepth) return true;
-
-    // Viewport 2D params changed, and not inheriting this state?
-    if (!m_secondaryCmdBufInheritViewport)
-    {
-      if (m_viewport.x != m_secondaryCmdBufViewport.x) return true;
-      if (m_viewport.y != m_secondaryCmdBufViewport.y) return true;
-      if (m_viewport.width != m_secondaryCmdBufViewport.width) return true;
-      if (m_viewport.height != m_secondaryCmdBufViewport.height) return true;
-    }
-
-    // It's okay at this point.
-    return false;
-  }
-
-  // If the secondary command buffer isn't suitable for use anymore,
-  // schedule it for deletion at the end of this frame, and record
-  // a new one. Must be called within a beginFrame/endFrame pair.
-  void updateSecondaryCmdBuf()
-  {
-    if (!needNewSecondaryCmdBuf()) return;
-
-    // Get a new cmd buffer and throw away the old one.
-    m_frameManager.freeFrameCommandBuffer(m_secondaryCmdBuf);
-    m_secondaryCmdBuf = m_frameManager.allocateSecondaryCommandBuffer();
-
-    // Begin subpass.
-    // The extension struct needed to enable inheriting 2D viewport+scisors.
-    VkCommandBufferInheritanceViewportScissorInfoNV inheritViewportInfo {
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_VIEWPORT_SCISSOR_INFO_NV,
-        nullptr,
-        VK_TRUE,
-        1, &m_viewport };
-
-    // Typical inheritance info, add the extra extension if the user requests
-    // it.
-    uint32_t subpass = 0;
-    VkCommandBufferInheritanceInfo inheritance {
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
-        use_VK_NV_inherited_viewport_scissor ? &inheritViewportInfo : nullptr,
-        m_renderPass, subpass };
-
-    auto flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
-               | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
-    VkCommandBufferBeginInfo beginInfo {
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        nullptr,
-        VkCommandBufferUsageFlags(flags),
-        &inheritance };
-    NVVK_CHECK(vkBeginCommandBuffer(m_secondaryCmdBuf, &beginInfo));
-
-    // Set viewport and scissors (if not inherited).
-    auto width  = uint32_t(m_viewport.width);
-    auto height = uint32_t(m_viewport.height);
-    if (!use_VK_NV_inherited_viewport_scissor)
-    {
-      vkCmdSetViewport(m_secondaryCmdBuf, 0, 1, &m_viewport);
-      VkRect2D scissor { { 0, 0 }, { width, height } };
-      vkCmdSetScissor(m_secondaryCmdBuf, 0, 1, &scissor);
-    }
-
-    VkDescriptorSet descriptorSet = m_bufferDescriptors.getSet();
-
-    // Draw background as full-screen triangle.
-    vkCmdBindPipeline(m_secondaryCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      m_backgroundPipeline);
-    vkCmdBindDescriptorSets(
-        m_secondaryCmdBuf,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        m_backgroundPipeline.getLayout(),
-        0, 1, &descriptorSet, 0, nullptr);
-    vkCmdDraw(m_secondaryCmdBuf, 3, 1, 0, 0);
-
-    // Draw objects. Bind vertex and index buffer.  Draw indirect
-    // allows us to vary the number of drawn objects without
-    // re-recording this secondary command buffer.
-    VkBuffer     vertexBuffer       = m_buffers.getStaticBuffer();
-    VkDeviceSize vertexBufferOffset = offsetof(StaticBufferData, vertices);
-    vkCmdBindVertexBuffers(
-        m_secondaryCmdBuf,
-        0, 1,
-        &vertexBuffer, &vertexBufferOffset);
-    vkCmdBindIndexBuffer(
-        m_secondaryCmdBuf,
-        m_buffers.getStaticBuffer(),
-        offsetof(StaticBufferData, indices),
-        StaticBufferData::indexType);
-    vkCmdBindPipeline(
-        m_secondaryCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_objectPipeline);
-    vkCmdBindDescriptorSets(
-        m_secondaryCmdBuf,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        m_objectPipeline.getLayout(),
-        0, 1, &descriptorSet, 0, nullptr);
-    vkCmdDrawIndexedIndirect(
-        m_secondaryCmdBuf,
-        m_buffers.getDynamicBuffer(),
-        offsetof(DynamicBufferData, indirectCmds),
-        MAX_MODELS,
-        sizeof(VkDrawIndexedIndirectCommand));
-
-    // End command buffer and record parameters used.
-    NVVK_CHECK(vkEndCommandBuffer(m_secondaryCmdBuf));
-    m_secondaryCmdBufViewport = m_viewport;
-    m_secondaryCmdBufInheritViewport = use_VK_NV_inherited_viewport_scissor;
-    if (printEvents)
-    {
-      printf(
-          "\x1b[36mRecorded secondary command buffer:\x1b[0m\n"
-          "  width=%u height=%u minDepth=%.2f maxDepth=%.2f inherit=%s\n",
-          width, height, minDepth, maxDepth,
-          m_secondaryCmdBufInheritViewport ? "\x1b[32mtrue\x1b[0m" :
-                                             "\x1b[31mfalse\x1b[0m");
-    }
-  }
-
-  // Write new values to dynamic staging buffer. No synchronization done.
-  void uncheckedUpdateDynamicStaging(DynamicBufferData* mapped)
-  {
     // Convert models into draw indexed indirect commands.
     for (size_t i = 0; i < m_modelDraws.size(); ++i)
     {
-      mapped->indirectCmds[i].indexCount    = m_modelDraws[i].indexCount;
+      mapped->indirectCmds[i].indexCount = m_modelDraws[i].indexCount;
       mapped->indirectCmds[i].instanceCount =
           uint32_t(m_modelDraws[i].instances.size());
       mapped->indirectCmds[i].firstIndex    = m_modelDraws[i].firstIndex;
@@ -1467,16 +1299,12 @@ private:
       mapped->indirectCmds[i].firstInstance = 0;
     }
 
-    // Update camera transformations.
-    cameraTransformsFromGlobalCamera(
-        &mapped->cameraTransforms, m_viewport.width, m_viewport.height);
-
     // Upload instances.
     for (size_t m = 0; m < m_modelDraws.size(); ++m)
     {
-      const auto& instances  = m_modelDraws[m].instances;
-      uint32_t instanceCount = uint32_t(instances.size());
-      uint32_t firstInstance = m_modelDraws[m].firstInstance;
+      const auto& instances     = m_modelDraws[m].instances;
+      uint32_t    instanceCount = uint32_t(instances.size());
+      uint32_t    firstInstance = m_modelDraws[m].firstInstance;
       assert(instanceCount <= m_modelDraws[m].maxInstances);
 
       for (uint32_t i = 0; i < instanceCount; ++i)
@@ -1484,59 +1312,288 @@ private:
         mapped->instances[i + firstInstance] = instances[i];
       }
     }
+
+
+    // Start the upload of the data from the DynamicBufferData staging buffer.
+    // Need the fence to ensure the transfer finishes before updating the
+    // staging buffer in the next frame.
+    vkResetFences(m_context, 1, &dynamicStagingFence);
+    vkQueueSubmit(m_frameManager.getQueue(),
+                  1, &m_dynamicBufferUploadSubmitInfo, m_buffers.getFence());
+
+    // Begin the frame, starting primary command buffer recording.
+    // beginFrame converts the intended width/height to actual
+    // swap chain width/height, which could differ from requested.
+    // Update (local copy of) viewport with this width/height.
+    VkCommandBuffer primaryCmdBuf;
+    nvvk::SwapChainAcquireState acquired;
+    m_frameManager.wantVsync(vsync);
+    m_frameManager.beginFrame(&primaryCmdBuf, &acquired, &width, &height);
+
+    // Do ImGui stuff.
+    m_gui.doFrame();
+
+    // Select framebuffer for this frame.
+    m_framebuffers.recreateNowIfNeeded(m_frameManager.getSwapChain());
+    VkFramebuffer framebuffer = m_framebuffers[acquired.index];
+
+    // Clear the swap image.
+    VkImage colorImage = m_frameManager.getSwapChain().getImage(acquired.index);
+
+    VkClearColorValue       value = { 0.07f, 0.1f, 0.07f, 1.0f };
+    VkImageSubresourceRange range;
+    memset(&range, 0, sizeof(range));
+    range.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel   = 0;
+    range.levelCount     = 1;
+    range.baseArrayLayer = 0;
+    range.layerCount     = 1;
+
+    nvvk::cmdBarrierImageLayout(primaryCmdBuf, colorImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    vkCmdClearColorImage(primaryCmdBuf, colorImage, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    nvvk::cmdBarrierImageLayout(primaryCmdBuf, colorImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    std::array<VkClearValue, 2> clearValues{};
+    clearValues[1].depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo beginInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                    nullptr,
+                                    m_renderPass,
+                                    framebuffer,
+                                    {{0, 0}, m_framebuffers.getExtent()},
+                                    uint32_t(clearValues.size()),
+                                    clearValues.data()};
+
+    // Draw to 4 viewports.
+    for (int y = 0; y < 2; y++)
+    {
+      for (int x = 0; x < 2; x++)
+      {
+        float offsx = x == 0 ? 0.0f : wobblex;
+        float offsy = y == 0 ? 0.0f : wobbley;
+        float w = (x == 0 ? wobblex : float(width) - wobblex) - 3;
+        float h = (y == 0 ? wobbley : float(height) - wobbley) - 3;
+        // Update camera transformations.
+        CameraTransforms cameraTransforms;
+        cameraTransformsFromGlobalCamera(&cameraTransforms, w, h);
+
+        VkMemoryBarrier uboBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        uboBarrier.srcAccessMask   = VK_ACCESS_UNIFORM_READ_BIT;
+        uboBarrier.dstAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(primaryCmdBuf, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             1, &uboBarrier, 0, nullptr, 0, nullptr);
+        vkCmdUpdateBuffer(primaryCmdBuf, m_buffers.getCameraBuffer(), 0, sizeof(cameraTransforms), &cameraTransforms);
+        uboBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        uboBarrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+        vkCmdPipelineBarrier(primaryCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0,
+                             1, &uboBarrier, 0, nullptr, 0, nullptr);
+
+        // Update viewport depth bounds from global variables (ImGui and
+        // glfw key callbacks modifiy them).
+        VkViewport viewport;
+        viewport.x        = offsx;
+        viewport.y        = offsy;
+        viewport.minDepth = minDepth;
+        viewport.maxDepth = maxDepth;
+        viewport.width    = w;
+        viewport.height   = h;
+
+        auto ix = int32_t(viewport.x);
+        auto iy = int32_t(viewport.y);
+        auto iw = uint32_t(viewport.width);
+        auto ih = uint32_t(viewport.height);
+        VkRect2D scissor{ {ix, iy}, {iw, ih} };
+
+        // If we are NOT inheriting viewport/scissor state, we have to use
+        // a new secondary for each viewport, as they may have different
+        // viewport/scissor commands. Otherwise, re-use the same one.
+        SubpassSecondary* pSubpassSecondary;
+        if (!use_VK_NV_inherited_viewport_scissor)
+          pSubpassSecondary = &m_subpassSecondaryArray[y][x];
+        else
+          pSubpassSecondary = &m_subpassSecondaryArray[0][0];
+
+        // This replaces the secondary command buffer if it is no longer suitable for use.
+        // VK_NV_inherited_viewport_scissor may prevent reconstructing this 2ndary buffer
+        bool needNew = needNewSecondaryCmdBuf(*pSubpassSecondary, viewport);
+        if (needNew)
+          replaceSecondaryCmdBuf(pSubpassSecondary, viewport);
+
+        // If inheriting viewport/scissor, set that state here for the
+        // secondary to inherit.  Otherwise, skip as the secondary
+        // sets that state for itself.
+        if (use_VK_NV_inherited_viewport_scissor)
+        {
+          vkCmdSetViewport(primaryCmdBuf, 0, 1, &viewport);
+          vkCmdSetScissor(primaryCmdBuf, 0, 1, &scissor);
+          // When inheriting this state, the same secondary command buffer
+          // should be usable for all 4 viewports.
+          assert(!needNew || x == 0 || y == 0);
+        }
+
+        // Execute subpass.
+        vkCmdBeginRenderPass(primaryCmdBuf, &beginInfo, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+        vkCmdExecuteCommands(primaryCmdBuf, 1, &pSubpassSecondary->cmdBuf);
+        vkCmdEndRenderPass(primaryCmdBuf);
+      }
+    }
+
+    // Give dear ImGui a chance to draw stuff too
+    vkCmdBeginRenderPass(primaryCmdBuf, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), primaryCmdBuf);
+    vkCmdEndRenderPass(primaryCmdBuf);
+
+    m_frameManager.endFrame(primaryCmdBuf);
   }
 
-  // Record commands to primary command buffer. Just starts render
-  // pass, set viewport/scissors, and call secondary command buffer.
-  void cmdDrawFrame(VkCommandBuffer cmdBuf, VkFramebuffer framebuffer)
+  float getViewportHorizontalScale()
   {
-    std::array<VkClearValue, 2> clearValues{};
-    clearValues[0].color.float32[0] = 1.0f;
-    clearValues[0].color.float32[1] = 1.0f;
-    clearValues[0].color.float32[2] = 1.0f;
-    clearValues[0].color.float32[3] = 1.0f;
-    clearValues[1].depthStencil     = {1.0f, 0};
+    return !wobbleViewport ? 1.0f :
+                             0.875f + 0.125f * float(sin(glfwGetTime() * 4.0));
+  }
 
-    auto width  = uint32_t(m_viewport.width);
-    auto height = uint32_t(m_viewport.height);
-    VkRect2D scissor { {0, 0}, {width, height} };
-
-    VkRenderPassBeginInfo beginInfo {
-        VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        nullptr,
-        m_renderPass,
-        framebuffer,
-        { { 0, 0 }, m_framebuffers.getExtent() },
-        uint32_t(clearValues.size()),
-        clearValues.data() };
-
-    // If the secondary command buffer doesn't inherit the viewport/scissor,
-    // then it sets it itself and the primary cmd buffer need not set that
-    // state.
-    if (m_secondaryCmdBufInheritViewport)
+  // Check if the secondary command buffer needs to be re-recorded,
+  // given the expect viewport size (and implied scissor size).
+  bool needNewSecondaryCmdBuf(const SubpassSecondary& subpassSecondary,
+                              VkViewport              viewport)
+  {
+    // Changed inheritance setting.
+    if (use_VK_NV_inherited_viewport_scissor != subpassSecondary.inheritViewportScissor)
     {
-      vkCmdSetViewport(cmdBuf, 0, 1, &m_viewport);
+      return true;
+    }
+
+    // Missing?
+    if (subpassSecondary.cmdBuf == nullptr) return true;
+
+    // Depth bounds changed?
+    if (viewport.minDepth != subpassSecondary.viewport.minDepth) return true;
+    if (viewport.maxDepth != subpassSecondary.viewport.maxDepth) return true;
+
+    // Viewport 2D params changed, and not inheriting this state?
+    if (!subpassSecondary.inheritViewportScissor)
+    {
+      if (viewport.x != subpassSecondary.viewport.x) return true;
+      if (viewport.y != subpassSecondary.viewport.y) return true;
+      if (viewport.width != subpassSecondary.viewport.width) return true;
+      if (viewport.height != subpassSecondary.viewport.height) return true;
+    }
+
+    // It's okay at this point.
+    return false;
+  }
+
+  // Schedule the subpass secondary command buffer for deletion at the end
+  // of this frame, and record a new one. Must be called within a
+  // beginFrame/endFrame pair.
+  void replaceSecondaryCmdBuf(SubpassSecondary* pSubpassSecondary, VkViewport viewport)
+  {
+    // Get a new cmd buffer and throw away the old one.
+    VkCommandBuffer& cmdBuf = pSubpassSecondary->cmdBuf;
+    m_frameManager.freeFrameCommandBuffer(cmdBuf);
+    cmdBuf = m_frameManager.allocateSecondaryCommandBuffer();
+
+    // Begin subpass.
+    // specific to VK_NV_inherited_viewport_scissor :
+    // The extension struct needed to enable inheriting 2D viewport+scisors.
+    VkCommandBufferInheritanceViewportScissorInfoNV inheritViewportInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_VIEWPORT_SCISSOR_INFO_NV,
+        nullptr,      // pNext
+        VK_TRUE,      // viewportScissor2D
+        1,            // viewportDepthCount
+        &viewport     // pViewportDepths
+    };
+
+    // Typical inheritance info, add the extra extension if the user requests it.
+    // VK_NV_inherited_viewport_scissor data passed in pNext
+    uint32_t subpass = 0;
+    VkCommandBufferInheritanceInfo inheritance {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+        use_VK_NV_inherited_viewport_scissor ? &inheritViewportInfo : nullptr,  //pNext
+        m_renderPass,                                                           // renderPass
+        subpass                                                                 // subpass
+                                                                                // framebuffer;
+                                                                                // occlusionQueryEnable;
+                                                                                // queryFlags;
+                                                                                // pipelineStatistics;
+    };
+
+    auto flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+               | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    VkCommandBufferBeginInfo beginInfo {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        nullptr,
+        VkCommandBufferUsageFlags(flags),
+        &inheritance };
+    NVVK_CHECK(vkBeginCommandBuffer(cmdBuf, &beginInfo));
+
+    // Set viewport and scissors (if not inherited).
+    auto width  = uint32_t(viewport.width);
+    auto height = uint32_t(viewport.height);
+    auto x      = int32_t(viewport.x);
+    auto y      = int32_t(viewport.y);
+    // VK_NV_inherited_viewport_scissor : must NOT specify viewport & Scissors
+    if (!use_VK_NV_inherited_viewport_scissor)
+    {
+      vkCmdSetViewport(cmdBuf, 0, 1, &viewport);
+      VkRect2D scissor { { x, y }, { width, height } };
       vkCmdSetScissor(cmdBuf, 0, 1, &scissor);
     }
-    vkCmdBeginRenderPass(cmdBuf, &beginInfo,
-                         VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
-    vkCmdExecuteCommands(cmdBuf, 1, &m_secondaryCmdBuf);
 
-    // Need to give Dear ImGui a chance to draw stuff too.  I don't
-    // try to reuse these commands, but it still needs to be in a
-    // temporary secondary command buffer to match the above.
-    // Somewhat distracting source of complexity...
-    VkCommandBufferInheritanceInfo inheritance {
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, nullptr,
-        m_renderPass, 0 };
-    VkCommandBuffer guiCmdBuf = m_frameManager.recordSecondaryCommandBuffer(
-        VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &inheritance);
-    m_frameManager.freeFrameCommandBuffer(guiCmdBuf);
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), guiCmdBuf);
-    vkEndCommandBuffer(guiCmdBuf);
-    vkCmdExecuteCommands(cmdBuf, 1, &guiCmdBuf);
+    VkDescriptorSet descriptorSet = m_bufferDescriptors.getSet();
 
-    vkCmdEndRenderPass(cmdBuf);
+    // Draw background as full-screen triangle.
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      m_backgroundPipeline);
+    vkCmdBindDescriptorSets(
+        cmdBuf,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_backgroundPipeline.getLayout(),
+        0, 1, &descriptorSet, 0, nullptr);
+    vkCmdDraw(cmdBuf, 3, 1, 0, 0);
+
+    // Draw objects. Bind vertex and index buffer.  Draw indirect
+    // allows us to vary the number of drawn objects without
+    // re-recording this secondary command buffer.
+    VkBuffer     vertexBuffer       = m_buffers.getStaticBuffer();
+    VkDeviceSize vertexBufferOffset = offsetof(StaticBufferData, vertices);
+    vkCmdBindVertexBuffers(
+        cmdBuf,
+        0, 1,
+        &vertexBuffer, &vertexBufferOffset);
+    vkCmdBindIndexBuffer(
+        cmdBuf,
+        m_buffers.getStaticBuffer(),
+        offsetof(StaticBufferData, indices),
+        StaticBufferData::indexType);
+    vkCmdBindPipeline(
+        cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_objectPipeline);
+    vkCmdBindDescriptorSets(
+        cmdBuf,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_objectPipeline.getLayout(),
+        0, 1, &descriptorSet, 0, nullptr);
+    vkCmdDrawIndexedIndirect(
+        cmdBuf,
+        m_buffers.getDynamicBuffer(),
+        offsetof(DynamicBufferData, indirectCmds),
+        MAX_MODELS,
+        sizeof(VkDrawIndexedIndirectCommand));
+
+    // End command buffer and record parameters used.
+    NVVK_CHECK(vkEndCommandBuffer(cmdBuf));
+    pSubpassSecondary->viewport               = viewport;
+    pSubpassSecondary->inheritViewportScissor = use_VK_NV_inherited_viewport_scissor;
+    if (printEvents)
+    {
+      printf(
+          "\x1b[36mRecorded secondary command buffer:\x1b[0m\n"
+          "  x=%i y=%i width=%u height=%u minDepth=%.2f maxDepth=%.2f inherit=%s\n",
+          x, y, width, height, minDepth, maxDepth,
+          use_VK_NV_inherited_viewport_scissor ? "\x1b[32mtrue\x1b[0m" :
+                                                 "\x1b[31mfalse\x1b[0m");
+    }
   }
 
   void fillStaticStagingInitDraws(const std::vector<Model>& models)
