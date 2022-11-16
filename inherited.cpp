@@ -1708,8 +1708,7 @@ private:
         instance.velocity.y -= gravityAcceleration * secondsPerTick;
 
         // Update position.
-        instance.position +=
-          nvmath::vec4(instance.velocity * secondsPerTick, 1.0f);
+        instance.position += instance.velocity * secondsPerTick;
 
         // Update rotation.
         instance.rotationAngle += instance.turnsPerSecond * secondsPerTick
@@ -2070,7 +2069,7 @@ static std::vector<Model> makeModels()
     float icing = std::max(0.0f, 4.0f * (smallAngle.s - 0.75f));
     result.position = nvmath::vec4f(
       bigRadius * radialUnitVector + smallRadius * ringUnitVector, 1.0f);
-    result.normal = ringUnitVector;
+    result.normal = nvmath::vec4f(ringUnitVector, 0.0f);
     result.color  = nvmath::vec4(
       icing*0.6, icing*0.3, icing*0.5, 0.6 * (1-icing));
     return result;
@@ -2092,7 +2091,7 @@ static std::vector<Model> makeModels()
       bigRadius * radialUnitVector
     + smallRadius * ringUnitVector
     + nvmath::vec3f(0, y, 0), 1.0f);
-    result.normal = ringUnitVector; // Close enough.
+    result.normal = nvmath::vec4f(ringUnitVector, 0.0f); // Close enough.
     result.color  = nvmath::vec4(0, 0, 0, 0.8);
     return result;
   };
