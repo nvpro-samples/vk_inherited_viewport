@@ -646,7 +646,8 @@ public:
     std::array<VkWriteDescriptorSet, 2> writes = {
         m_descriptors.makeWrite(0, CAMERA_TRANSFORMS_BINDING, &uboInfo),
         m_descriptors.makeWrite(0, INSTANCES_BINDING, &instanceBufferInfo)};
-    vkUpdateDescriptorSets(device, writes.size(), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(),
+        0, nullptr);
   }
   // Destructor not needed -- m_descriptors cleans itself up.
 
@@ -996,7 +997,8 @@ public:
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,
         VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        poolSizes.size(), poolSizes.size(), poolSizes.data() };
+        uint32_t(poolSizes.size()), uint32_t(poolSizes.size()),
+        poolSizes.data() };
     assert(m_pool == VK_NULL_HANDLE);
     NVVK_CHECK(vkCreateDescriptorPool(ctx, &poolInfo, nullptr, &m_pool));
 
