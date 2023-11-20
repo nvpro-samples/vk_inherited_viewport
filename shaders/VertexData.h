@@ -8,7 +8,6 @@
 #ifdef __cplusplus
 #include <array>
 #include <vulkan/vulkan.h>
-#include "nvmath/nvmath_glsltypes.h" // emulate glsl types in C++
 #endif
 
 #define POSITION_ATTRIB_LOCATION 0
@@ -18,7 +17,7 @@
 struct VertexData
 {
   #ifdef __cplusplus
-    using vec4 = nvmath::vec4;
+    using vec4 = glm::vec4;
   #endif
 
   vec4 position;

@@ -5,14 +5,10 @@
 #ifndef VK_NV_INHERITED_SCISSOR_VIEWPORT_INSTANCE_DATA_H_
 #define VK_NV_INHERITED_SCISSOR_VIEWPORT_INSTANCE_DATA_H_
 
-#ifdef __cplusplus
-#include <nvmath/nvmath_glsltypes.h> // emulate glsl types in C++
-#endif
-
 struct InstanceData
 {
   #ifdef __cplusplus
-    using mat4 = nvmath::mat4;
+    using mat4 = glm::mat4;
   #endif
 
   mat4 modelMatrix;
