@@ -896,7 +896,7 @@ public:
                                    [](VkResult err) { NVVK_CHECK(err); }};
 
     ImGui_ImplVulkan_Init(&info, renderPass);
-    ImGui_ImplVulkan_CreateFontsTexture(cmdBuf);
+    ImGui_ImplVulkan_CreateFontsTexture();
 
     ImGui_ImplGlfw_InitForVulkan(pWindow, false);
   }
@@ -906,7 +906,7 @@ public:
   ~Gui()
   {
     vkDestroyDescriptorPool(m_device, m_pool, nullptr);
-    ImGui_ImplVulkan_DestroyFontUploadObjects();
+    ImGui_ImplVulkan_DestroyFontsTexture();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
   }
