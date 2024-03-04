@@ -879,23 +879,23 @@ public:
     assert(m_pool == VK_NULL_HANDLE);
     NVVK_CHECK(vkCreateDescriptorPool(ctx, &poolInfo, nullptr, &m_pool));
 
-    ImGui_ImplVulkan_InitInfo info{ctx.m_instance,
-                                   ctx.m_physicalDevice,
-                                   ctx.m_device,
-                                   frameManager.getQueueFamilyIndex(),
-                                   frameManager.getQueue(),
-                                   VK_NULL_HANDLE,  // No need for pipeline cache for simple sample.
-                                   m_pool,
-                                   subpass,
-                                   frameManager.getSwapChain().getImageCount(),
-                                   frameManager.getSwapChain().getImageCount(),
-                                   VK_SAMPLE_COUNT_1_BIT,
-                                   false,
-                                   VK_FORMAT_UNDEFINED,
-                                   nullptr,
-                                   [](VkResult err) { NVVK_CHECK(err); }};
+    ImGui_ImplVulkan_InitInfo info{};
+    info.Instance            = ctx.m_instance;
+    info.PhysicalDevice      = ctx.m_physicalDevice;
+    info.Device              = ctx.m_device;
+    info.QueueFamily         = frameManager.getQueueFamilyIndex();
+    info.Queue               = frameManager.getQueue();
+    info.DescriptorPool      = m_pool;
+    info.RenderPass          = renderPass;
+    info.Subpass             = subpass;
+    info.MinImageCount       = frameManager.getSwapChain().getImageCount();
+    info.ImageCount          = frameManager.getSwapChain().getImageCount();
+    info.MSAASamples         = VK_SAMPLE_COUNT_1_BIT;
+    info.UseDynamicRendering = false;
+    info.Allocator           = nullptr;
+    info.CheckVkResultFn     = [](VkResult err) { NVVK_CHECK(err); };
 
-    ImGui_ImplVulkan_Init(&info, renderPass);
+    ImGui_ImplVulkan_Init(&info);
     ImGui_ImplVulkan_CreateFontsTexture();
 
     ImGui_ImplGlfw_InitForVulkan(pWindow, false);
@@ -1554,8 +1554,8 @@ private:
 
         // Compute new model matrix.
         glm::mat4 M(1.f);
-        M = glm::translate(M, instance.position);
-        M = glm::rotate(M, instance.rotationAngle, instance.rotationAxis);
+        M                    = glm::translate(M, instance.position);
+        M                    = glm::rotate(M, instance.rotationAngle, instance.rotationAxis);
         instance.modelMatrix = M;
       }
     }
